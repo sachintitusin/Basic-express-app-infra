@@ -1,0 +1,14 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - pip install cfn-lint
+  build:
+    commands:
+      - echo "Linting scalable-express.yml..."
+      - cfn-lint scalable-express.yml
+artifacts:
+  files:
+    - scalable-express.yml
