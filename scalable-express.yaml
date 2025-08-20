@@ -208,6 +208,7 @@ Resources:
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: express-ec2-role 
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
