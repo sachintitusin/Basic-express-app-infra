@@ -7,8 +7,8 @@ phases:
       - pip install cfn-lint
   build:
     commands:
-      - echo "Linting scalable-express.yml..."
-      - cfn-lint scalable-express.yml
+      - echo "Linting scalable-express.yaml..."
+      - cfn-lint scalable-express.yaml
 artifacts:
   files:
-    - scalable-express.yml
+    - scalable-express.yaml
