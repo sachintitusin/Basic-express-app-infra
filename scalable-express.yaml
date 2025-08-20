@@ -2,6 +2,9 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: Scalable Express app on EC2 with ALB + ASG (private instances, public ALB)
 
 Parameters:
+  AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
   VpcCidr: { Type: String, Default: 10.0.0.0/16 }
   PublicSubnet1Cidr: { Type: String, Default: 10.0.0.0/24 }
   PublicSubnet2Cidr: { Type: String, Default: 10.0.1.0/24 }
@@ -224,7 +227,7 @@ Resources:
     Properties:
       LaunchTemplateData:
         IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
-        ImageId: !Ref AWS::SSM::ParameterValue/AWSAMI-AL2023-Kernel-6.1-x86_64
+        ImageId: !Ref AmiId
         InstanceType: !Ref InstanceType
         NetworkInterfaces:
           - AssociatePublicIpAddress: false
