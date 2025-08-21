@@ -375,12 +375,12 @@ Resources:
       MaxSize: !Ref MaxSize
       TargetGroupARNs: [!Ref TargetGroup]
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 600
+      HealthCheckGracePeriod: 120
       DefaultInstanceWarmup: 120
-    CreationPolicy:
-      ResourceSignal:
-        Count: 1
-        Timeout: PT20M
+    # CreationPolicy:
+    #   ResourceSignal:
+    #     Count: 1
+    #     Timeout: PT20M
 
   # Pause instances on launch until the app is ready; instance completes this in UserData.
   LaunchWaitHook:
