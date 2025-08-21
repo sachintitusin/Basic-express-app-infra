@@ -16,11 +16,7 @@ Parameters:
   MaxSize: { Type: Number, Default: 4 }
   CpuTarget: { Type: Number, Default: 50 } # target tracking CPU %
 
-Mappings:
-  RegionMap:
-    ap-south-1:
-      AZ1: ap-south-1a
-      AZ2: ap-south-1b
+
 
 Resources:
   VPC:
@@ -48,7 +44,7 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: !Ref PublicSubnet1Cidr
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ1]
+      AvailabilityZone: !Select [0, !GetAZs '']
       Tags: [{Key: Name, Value: public-a}]
 
   PublicSubnet2:
@@ -57,7 +53,7 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: !Ref PublicSubnet2Cidr
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ2]
+      AvailabilityZone: !Select [1, !GetAZs '']
       Tags: [{Key: Name, Value: public-b}]
 
   PrivateSubnet1:
@@ -66,7 +62,7 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: !Ref PrivateSubnet1Cidr
       MapPublicIpOnLaunch: false
-      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ1]
+      AvailabilityZone: !Select [0, !GetAZs '']
       Tags: [{Key: Name, Value: private-a}]
 
   PrivateSubnet2:
@@ -75,7 +71,7 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: !Ref PrivateSubnet2Cidr
       MapPublicIpOnLaunch: false
-      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ2]
+      AvailabilityZone: !Select [1, !GetAZs '']
       Tags: [{Key: Name, Value: private-b}]
 
   PublicRT:
@@ -217,7 +213,16 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-
+      Policies:
+        - PolicyName: AllowCfnSignal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                  - cloudformation:DescribeStackResource
+                Resource: "*"
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
@@ -238,9 +243,19 @@ Resources:
           Fn::Base64: !Sub |
             #!/bin/bash
             set -euxo pipefail
+
+            # --- Install CFN helper scripts on AL2023 ---
             dnf -y update
-            dnf -y install curl tar gzip
-            # Install Node via nvm (stable)
+            dnf -y install python3-pip curl tar gzip
+            pip3 install --upgrade 'https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz'
+
+            # Always signal success/failure on exit
+            trap 'RC=$?; /usr/local/bin/cfn-signal --stack ${AWS::StackName} --resource ASG --region ${AWS::Region} --exit-code $RC; exit $RC' EXIT
+
+            # --- Run cfn-init (reads ASG Metadata -> AWS::CloudFormation::Init) ---
+            /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource ASG --region ${AWS::Region}
+
+            # --- Your app setup (unchanged) ---
             export NVM_DIR=/usr/local/nvm
             mkdir -p $NVM_DIR
             curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
@@ -249,7 +264,7 @@ Resources:
             ln -s $(which node) /usr/local/bin/node || true
             ln -s $(which npm) /usr/local/bin/npm || true
             npm install -g pm2
-            # App dir
+
             mkdir -p /opt/app
             cat >/opt/app/server.js <<'EOF'
             const express = require('express');
@@ -258,6 +273,7 @@ Resources:
             app.get('/', (_, res) => res.send('Hello from Express ASG!'));
             app.listen(${AppPort}, () => console.log('Server on ${AppPort}'));
             EOF
+
             cd /opt/app
             npm init -y
             npm install express
@@ -265,10 +281,15 @@ Resources:
             pm2 startup systemd -u root --hp /root
             pm2 save
             systemctl enable pm2-root
-            # Open firewall not needed; SG controls traffic.
-
+  
   ASG:
     Type: AWS::AutoScaling::AutoScalingGroup
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_marker:
+              command: "echo 'cfn-init ran' > /var/log/cfn-init.marker"
     Properties:
       VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
       LaunchTemplate:
@@ -281,7 +302,7 @@ Resources:
       HealthCheckType: ELB
       HealthCheckGracePeriod: 300
       DefaultInstanceWarmup: 120
-    CreationPolicy:
+    CreationPolicy:                 # ← CFN will WAIT for the signal
       ResourceSignal:
         Count: 1
         Timeout: PT15M
