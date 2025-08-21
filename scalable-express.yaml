@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Scalable Express app on EC2 with ALB + ASG (private instances, public ALB)
+Description: Scalable Express app on EC2 with ALB + ASG (private instances, public ALB) + cfn-init/signal + VPC Flow Logs
 
 Parameters:
   AmiId:
@@ -16,8 +16,6 @@ Parameters:
   MaxSize: { Type: Number, Default: 4 }
   CpuTarget: { Type: Number, Default: 50 } # target tracking CPU %
 
-
-
 Resources:
   VPC:
     Type: AWS::EC2::VPC
@@ -25,12 +23,12 @@ Resources:
       CidrBlock: !Ref VpcCidr
       EnableDnsSupport: true
       EnableDnsHostnames: true
-      Tags: [{Key: Name, Value: express-vpc}]
-  
+      Tags: [{ Key: Name, Value: express-vpc }]
+
   IGW:
     Type: AWS::EC2::InternetGateway
     Properties:
-      Tags: [{Key: Name, Value: express-igw}]
+      Tags: [{ Key: Name, Value: express-igw }]
 
   AttachIgw:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -45,7 +43,7 @@ Resources:
       CidrBlock: !Ref PublicSubnet1Cidr
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
-      Tags: [{Key: Name, Value: public-a}]
+      Tags: [{ Key: Name, Value: public-a }]
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
@@ -54,7 +52,7 @@ Resources:
       CidrBlock: !Ref PublicSubnet2Cidr
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [1, !GetAZs '']
-      Tags: [{Key: Name, Value: public-b}]
+      Tags: [{ Key: Name, Value: public-b }]
 
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
@@ -63,7 +61,7 @@ Resources:
       CidrBlock: !Ref PrivateSubnet1Cidr
       MapPublicIpOnLaunch: false
       AvailabilityZone: !Select [0, !GetAZs '']
-      Tags: [{Key: Name, Value: private-a}]
+      Tags: [{ Key: Name, Value: private-a }]
 
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
@@ -72,7 +70,7 @@ Resources:
       CidrBlock: !Ref PrivateSubnet2Cidr
       MapPublicIpOnLaunch: false
       AvailabilityZone: !Select [1, !GetAZs '']
-      Tags: [{Key: Name, Value: private-b}]
+      Tags: [{ Key: Name, Value: private-b }]
 
   PublicRT:
     Type: AWS::EC2::RouteTable
@@ -108,7 +106,7 @@ Resources:
     Properties:
       AllocationId: !GetAtt EIPNat.AllocationId
       SubnetId: !Ref PublicSubnet1
-      Tags: [{Key: Name, Value: natgw-a}]
+      Tags: [{ Key: Name, Value: natgw-a }]
 
   PrivateRTA:
     Type: AWS::EC2::RouteTable
@@ -189,7 +187,12 @@ Resources:
       Port: !Ref AppPort
       TargetType: instance
       HealthCheckPath: /health
-      Matcher: { HttpCode: '200' }
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      DeregistrationDelayTimeoutSeconds: 30
+      Matcher: { HttpCode: '200-399' }
 
   ListenerHttp:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -204,7 +207,7 @@ Resources:
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: express-ec2-role 
+      RoleName: express-ec2-role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -213,6 +216,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy   # allow shipping logs to CW
       Policies:
         - PolicyName: AllowCfnSignal
           PolicyDocument:
@@ -223,6 +227,7 @@ Resources:
                   - cloudformation:SignalResource
                   - cloudformation:DescribeStackResource
                 Resource: "*"
+
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
@@ -236,7 +241,7 @@ Resources:
         ImageId: !Ref AmiId
         InstanceType: !Ref InstanceType
         NetworkInterfaces:
-          - AssociatePublicIpAddress: false
+          - AssociatePublicIpAddress: false   # set true once if you want a one-shot debug
             DeviceIndex: 0
             Groups: [!Ref AppSG]
         UserData:
@@ -255,7 +260,7 @@ Resources:
             # --- Run cfn-init (reads ASG Metadata -> AWS::CloudFormation::Init) ---
             /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource ASG --region ${AWS::Region}
 
-            # --- Your app setup (unchanged) ---
+            # --- App setup ---
             export NVM_DIR=/usr/local/nvm
             mkdir -p $NVM_DIR
             curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
@@ -271,7 +276,7 @@ Resources:
             const app = express();
             app.get('/health', (_, res) => res.status(200).send('OK'));
             app.get('/', (_, res) => res.send('Hello from Express ASG!'));
-            app.listen(${AppPort}, () => console.log('Server on ${AppPort}'));
+            app.listen(${AppPort}, '0.0.0.0', () => console.log('Server on ${AppPort}'));
             EOF
 
             cd /opt/app
@@ -281,9 +286,45 @@ Resources:
             pm2 startup systemd -u root --hp /root
             pm2 save
             systemctl enable pm2-root
-  
+
+            # --- Readiness self-test: ensure /health returns 200 locally before success ---
+            for i in {1..20}; do curl -sf http://127.0.0.1:${AppPort}/health && break || sleep 3; done
+            curl -sf http://127.0.0.1:${AppPort}/health
+
+            # --- (Optional) CloudWatch Agent to ship logs (cloud-init & pm2) ---
+            dnf -y install amazon-cloudwatch-agent || true
+            mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+            cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      { "file_path": "/var/log/cloud-init-output.log",
+                        "log_group_name": "/express/asg",
+                        "log_stream_name": "{instance_id}/cloud-init",
+                        "timestamp_format": "%b %d %H:%M:%S" },
+                      { "file_path": "/root/.pm2/logs/*.log",
+                        "log_group_name": "/express/asg",
+                        "log_stream_name": "{instance_id}/pm2" }
+                    ]
+                  }
+                }
+              }
+            }
+            JSON
+            systemctl enable amazon-cloudwatch-agent || true
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s || true
+
   ASG:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - PrivateRouteA
+      - PrivateRouteB
+      - AssocPrivate1
+      - AssocPrivate2
     Metadata:
       AWS::CloudFormation::Init:
         config:
@@ -302,7 +343,7 @@ Resources:
       HealthCheckType: ELB
       HealthCheckGracePeriod: 300
       DefaultInstanceWarmup: 120
-    CreationPolicy:                 # ← CFN will WAIT for the signal
+    CreationPolicy:
       ResourceSignal:
         Count: 1
         Timeout: PT15M
@@ -316,6 +357,56 @@ Resources:
         PredefinedMetricSpecification:
           PredefinedMetricType: ASGAverageCPUUtilization
         TargetValue: !Ref CpuTarget
+
+  # --- VPC Flow Logs to CloudWatch (prove ALB<->EC2 traffic path) ---
+  CWFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /vpc/flowlogs
+      RetentionInDays: 7
+
+  VpcFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: vpc-flowlogs-to-cw
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: allow-write-to-cw-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs:*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs:log-stream:*
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      MaxAggregationInterval: 60
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref CWFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VpcFlowLogsRole.Arn
+      LogFormat: >-
+        ${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr}
+        ${srcport} ${dstport} ${protocol} ${packets} ${bytes}
+        ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id}
+        ${tcp-flags} ${flow-direction}
 
 Outputs:
   AlbDNS:
