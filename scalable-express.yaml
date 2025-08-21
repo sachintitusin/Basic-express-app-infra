@@ -191,8 +191,10 @@ Resources:
       HealthCheckTimeoutSeconds: 10
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 2
-      DeregistrationDelayTimeoutSeconds: 30
       Matcher: { HttpCode: '200-399' }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
 
   ListenerHttp:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -216,7 +218,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy   # allow shipping logs to CW
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
         - PolicyName: AllowCfnSignal
           PolicyDocument:
@@ -233,6 +235,12 @@ Resources:
     Properties:
       Roles: [!Ref InstanceRole]
 
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /express/asg
+      RetentionInDays: 7
+
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -241,7 +249,7 @@ Resources:
         ImageId: !Ref AmiId
         InstanceType: !Ref InstanceType
         NetworkInterfaces:
-          - AssociatePublicIpAddress: false   # set true once if you want a one-shot debug
+          - AssociatePublicIpAddress: false   # set true once for quick debug if needed
             DeviceIndex: 0
             Groups: [!Ref AppSG]
         UserData:
@@ -291,7 +299,7 @@ Resources:
             for i in {1..20}; do curl -sf http://127.0.0.1:${AppPort}/health && break || sleep 3; done
             curl -sf http://127.0.0.1:${AppPort}/health
 
-            # --- (Optional) CloudWatch Agent to ship logs (cloud-init & pm2) ---
+            # --- CloudWatch Agent to ship logs (cloud-init & pm2) ---
             dnf -y install amazon-cloudwatch-agent || true
             mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
             cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
@@ -358,7 +366,7 @@ Resources:
           PredefinedMetricType: ASGAverageCPUUtilization
         TargetValue: !Ref CpuTarget
 
-  # --- VPC Flow Logs to CloudWatch (prove ALB<->EC2 traffic path) ---
+  # --- VPC Flow Logs to CloudWatch ---
   CWFlowLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -373,8 +381,7 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal:
-              Service: vpc-flow-logs.amazonaws.com
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
             Action: sts:AssumeRole
       Policies:
         - PolicyName: allow-write-to-cw-logs
@@ -385,12 +392,12 @@ Resources:
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs:*
+              - Effect: Allow
+                Action:
                   - logs:DescribeLogGroups
                   - logs:DescribeLogStreams
-                Resource:
-                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs
-                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs:*
-                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/flowlogs:log-stream:*
+                Resource: "*"
 
   VPCFlowLog:
     Type: AWS::EC2::FlowLog
