@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Scalable Express app on EC2 with ALB + ASG (private instances, public ALB) + cfn-init/signal + VPC Flow Logs
+Description: Scalable Express app on EC2 with ALB + ASG (private instances, public ALB) + lifecycle hook + cfn-signal + CloudWatch logs + VPC Flow Logs
 
 Parameters:
   AmiId:
@@ -17,6 +17,7 @@ Parameters:
   CpuTarget: { Type: Number, Default: 50 } # target tracking CPU %
 
 Resources:
+  # --- Networking ---
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -144,6 +145,7 @@ Resources:
       RouteTableId: !Ref PrivateRTB
       SubnetId: !Ref PrivateSubnet2
 
+  # --- Security Groups ---
   AlbSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -172,6 +174,7 @@ Resources:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
 
+  # --- Load Balancer ---
   ALB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -206,6 +209,7 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
+  # --- Instance IAM ---
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -229,6 +233,16 @@ Resources:
                   - cloudformation:SignalResource
                   - cloudformation:DescribeStackResource
                 Resource: "*"
+        - PolicyName: AllowLifecycleComplete
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                  - autoscaling:RecordLifecycleActionHeartbeat
+                  - autoscaling:DescribeAutoScalingInstances
+                Resource: "*"
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -241,6 +255,7 @@ Resources:
       LogGroupName: /express/asg
       RetentionInDays: 7
 
+  # --- Launch Template (UserData installs Node, runs app, signals ready, completes lifecycle) ---
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -249,45 +264,39 @@ Resources:
         ImageId: !Ref AmiId
         InstanceType: !Ref InstanceType
         NetworkInterfaces:
-          - AssociatePublicIpAddress: false   # set true once for quick debug if needed
+          - AssociatePublicIpAddress: false
             DeviceIndex: 0
             Groups: [!Ref AppSG]
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
+            exec > /var/log/user-data.log 2>&1
             set -euxo pipefail
 
-            # --- Install CFN helper scripts on AL2023 ---
+            # --- Install CFN helper scripts (for cfn-signal) ---
             dnf -y update
-            dnf -y install python3-pip curl tar gzip
+            dnf -y install python3-pip awscli
             pip3 install --upgrade 'https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz'
 
-            # Always signal success/failure on exit
+            # Always signal success/failure on exit (CloudFormation CreationPolicy)
             trap 'RC=$?; /usr/local/bin/cfn-signal --stack ${AWS::StackName} --resource ASG --region ${AWS::Region} --exit-code $RC; exit $RC' EXIT
 
-            # --- Run cfn-init (reads ASG Metadata -> AWS::CloudFormation::Init) ---
-            /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource ASG --region ${AWS::Region}
-
-            # --- App setup ---
-            export NVM_DIR=/usr/local/nvm
-            mkdir -p $NVM_DIR
-            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-            source $NVM_DIR/nvm.sh
-            nvm install --lts
-            ln -s $(which node) /usr/local/bin/node || true
-            ln -s $(which npm) /usr/local/bin/npm || true
+            # --- App runtime: Node.js, npm, pm2 (from AL2023 repos) ---
+            dnf -y install nodejs npm
             npm install -g pm2
 
+            # --- App code (sample Express; replace with your artifact if needed) ---
             mkdir -p /opt/app
-            cat >/opt/app/server.js <<'EOF'
+            cd /opt/app
+            cat > server.js <<'EOF'
             const express = require('express');
             const app = express();
+            const PORT = ${AppPort};
             app.get('/health', (_, res) => res.status(200).send('OK'));
-            app.get('/', (_, res) => res.send('Hello from Express ASG!'));
-            app.listen(${AppPort}, '0.0.0.0', () => console.log('Server on ${AppPort}'));
+            app.get('/',      (_, res) => res.send('Hello from Express ASG!'));
+            app.listen(PORT, '0.0.0.0', () => console.log('Server on ' + PORT));
             EOF
 
-            cd /opt/app
             npm init -y
             npm install express
             pm2 start server.js --name app -f
@@ -295,11 +304,24 @@ Resources:
             pm2 save
             systemctl enable pm2-root
 
-            # --- Readiness self-test: ensure /health returns 200 locally before success ---
-            for i in {1..20}; do curl -sf http://127.0.0.1:${AppPort}/health && break || sleep 3; done
+            # --- Readiness: ensure /health returns 200 before continuing ---
+            for i in {1..40}; do curl -sf http://127.0.0.1:${AppPort}/health && break || sleep 3; done
             curl -sf http://127.0.0.1:${AppPort}/health
 
-            # --- CloudWatch Agent to ship logs (cloud-init & pm2) ---
+            # --- Complete ASG launch lifecycle hook (let instance enter InService/register) ---
+            IID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            ASG_NAME=$(aws autoscaling describe-auto-scaling-instances \
+              --instance-ids "$IID" \
+              --query 'AutoScalingInstances[0].AutoScalingGroupName' \
+              --output text --region ${AWS::Region})
+            aws autoscaling complete-lifecycle-action \
+              --lifecycle-action-result CONTINUE \
+              --instance-id "$IID" \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --lifecycle-hook-name launch-wait-hook \
+              --region ${AWS::Region} || true
+
+            # --- CloudWatch Agent: ship cloud-init & pm2 logs ---
             dnf -y install amazon-cloudwatch-agent || true
             mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
             cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
@@ -312,6 +334,9 @@ Resources:
                         "log_group_name": "/express/asg",
                         "log_stream_name": "{instance_id}/cloud-init",
                         "timestamp_format": "%b %d %H:%M:%S" },
+                      { "file_path": "/var/log/user-data.log",
+                        "log_group_name": "/express/asg",
+                        "log_stream_name": "{instance_id}/user-data" },
                       { "file_path": "/root/.pm2/logs/*.log",
                         "log_group_name": "/express/asg",
                         "log_stream_name": "{instance_id}/pm2" }
@@ -326,6 +351,7 @@ Resources:
               -a fetch-config -m ec2 \
               -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s || true
 
+  # --- Auto Scaling Group (+ CreationPolicy waits for cfn-signal) ---
   ASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn:
@@ -349,12 +375,22 @@ Resources:
       MaxSize: !Ref MaxSize
       TargetGroupARNs: [!Ref TargetGroup]
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 300
+      HealthCheckGracePeriod: 600
       DefaultInstanceWarmup: 120
     CreationPolicy:
       ResourceSignal:
         Count: 1
-        Timeout: PT15M
+        Timeout: PT20M
+
+  # Pause instances on launch until the app is ready; instance completes this in UserData.
+  LaunchWaitHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      AutoScalingGroupName: !Ref ASG
+      LifecycleHookName: launch-wait-hook
+      LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+      HeartbeatTimeout: 900
+      DefaultResult: ABANDON
 
   CpuTargetTracking:
     Type: AWS::AutoScaling::ScalingPolicy
@@ -366,7 +402,7 @@ Resources:
           PredefinedMetricType: ASGAverageCPUUtilization
         TargetValue: !Ref CpuTarget
 
-  # --- VPC Flow Logs to CloudWatch ---
+  # --- VPC Flow Logs to CloudWatch (helps debug) ---
   CWFlowLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
